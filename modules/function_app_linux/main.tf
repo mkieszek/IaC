@@ -1,77 +1,66 @@
-# c:\dev\repos\IaC\modules\function_app_linux\main.tf
-data "azurerm_resource_group" "main" {
-  name = var.config.resource_group_name
-}
-
-// Storage Account for the Function App
-resource "azurerm_storage_account" "main" {
-  name                     = var.config.storage_account_name
-  resource_group_name      = data.azurerm_resource_group.main.name
-  location                 = data.azurerm_resource_group.main.location
-  account_tier             = "Standard"
-  account_replication_type = "LRS"
-}
-
-resource "azurerm_log_analytics_workspace" "main" {
-  name                = var.config.log_analytics_workspace_name
-  location            = data.azurerm_resource_group.main.location
-  resource_group_name = data.azurerm_resource_group.main.name
-  sku                 = local.log_analytics_workspace_config.sku
-  retention_in_days   = local.log_analytics_workspace_config.retention_in_days
-}
-
-resource "azurerm_application_insights" "main" {
-  name                = var.config.app_insights_name
-  location            = data.azurerm_resource_group.main.location
-  resource_group_name = data.azurerm_resource_group.main.name
-  workspace_id        = azurerm_log_analytics_workspace.main.id
-  application_type    = local.application_insights_config.application_type
-}
-
-resource "azurerm_service_plan" "main" {
-  name                = var.config.service_plan_name
-  resource_group_name = data.azurerm_resource_group.main.name
-  location            = data.azurerm_resource_group.main.location
-  os_type             = local.service_plan_config.os_type
-  sku_name            = local.service_plan_config.sku_name
-}
-
+# Main Function App
 resource "azurerm_linux_function_app" "main" {
-  name                = var.config.name
-  resource_group_name = data.azurerm_resource_group.main.name
-  location            = data.azurerm_resource_group.main.location
+  name                = var.function_app_name
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  service_plan_id     = var.service_plan_id
 
-  storage_account_name         = azurerm_storage_account.main.name
-  storage_account_access_key   = azurerm_storage_account.main.primary_access_key
+  storage_account_name       = var.storage_account_name
+  storage_account_access_key = var.storage_account_access_key
 
-  service_plan_id = azurerm_service_plan.main.id
-  https_only      = true
+  # User-assigned managed identity (best practice for secure resource access)
+  identity {
+    type         = length(var.identity_ids) > 0 ? "UserAssigned" : "SystemAssigned"
+    identity_ids = var.identity_ids
+  }
 
-  app_settings = merge(
-    var.config.app_settings,
-    { "APPLICATIONINSIGHTS_CONNECTION_STRING" = azurerm_application_insights.main.connection_string }
-  )
+  # Simple assignment from config (as per your previous request)
+  app_settings = var.config.app_settings
+  site_config  = var.config.site_config
 
-  site_config = var.config.site_config
+  # Best practice: Enforce HTTPS and TLS (Linux-specific security)
+  https_only = true
 
-  tags = var.config.tags
+  tags = var.tags
+
+  lifecycle {
+    ignore_changes = [
+      app_settings["WEBSITE_RUN_FROM_PACKAGE"],  # Ignore deployment package changes
+    ]
+  }
 }
 
-resource "azurerm_function_app_slot" "slot" {
-  for_each = var.config.slots
+# Function App Slots (new addition using azurerm_linux_function_app_slot)
+resource "azurerm_linux_function_app_slot" "slots" {
+  for_each = try(var.config.slots, {})
 
-  name            = each.value.name
-  function_app_id = azurerm_linux_function_app.main.id
+  name                = each.key  # Use map key as slot name (e.g., "staging")
+  function_app_id     = azurerm_linux_function_app.main.id
+  storage_account_name       = var.storage_account_name
+  storage_account_access_key = var.storage_account_access_key
 
-  storage_account_name         = azurerm_storage_account.main.name
-  storage_account_access_key   = azurerm_storage_account.main.primary_access_key
+  # User-assigned managed identity for each slot (same as main for consistency)
+  identity {
+    type         = length(var.identity_ids) > 0 ? "UserAssigned" : "SystemAssigned"
+    identity_ids = var.identity_ids  # Can be overridden per slot if needed
+  }
 
-  app_settings = merge(
-    each.value.app_settings,
-    { "APPLICATIONINSIGHTS_CONNECTION_STRING" = azurerm_application_insights.main.connection_string }
-  )
-  site_config = each.value.site_config
+  # Simple assignment from slot configuration
+  app_settings = lookup(each.value, "app_settings", {})
+  site_config  = lookup(each.value, "site_config", {})
 
-  # Make slot-specific app_settings sticky
-  slot_settings = keys(each.value.app_settings)
+  # Best practice: Enforce HTTPS and TLS for slots
+  https_only = true
+
+  # Optional: Sticky settings for safe slot swaps (Microsoft best practice for zero-downtime)
+  dynamic "sticky_settings" {
+    for_each = lookup(each.value, "sticky_settings", []) != [] ? [1] : []
+    content {
+      app_setting_names = lookup(each.value, "sticky_settings", [])
+    }
+  }
+
+  tags = var.tags
+
+  depends_on = [azurerm_linux_function_app.main]
 }
